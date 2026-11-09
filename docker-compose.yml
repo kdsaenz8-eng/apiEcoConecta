@@ -1,0 +1,39 @@
+# Orquestación desde la carpeta /backend para pruebas aisladas del módulo API
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: ecoconecta_postgres_local
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ecoconecta_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ecoconecta_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-ecoconecta_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_backend_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ecoconecta_user} -d ${POSTGRES_DB:-ecoconecta_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecoconecta_api_local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ecoconecta_user}:${POSTGRES_PASSWORD:-ecoconecta_pass}@db:5432/${POSTGRES_DB:-ecoconecta_db}
+      SECRET_KEY: ${SECRET_KEY:-ecoconecta-ecoconecta-secret-key-trl5-2026}
+      ACCESS_TOKEN_EXPIRE_MINUTES: 1440
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_backend_data:
+
