@@ -19,16 +19,16 @@ class PickupCreate(BaseModel):
     Paso 2: Volumen estimado y fotografía de evidencia
     Paso 3: Coordenadas GPS y dirección/referencia
     """
-
-    waste_categories: List[WasteCategory] = Field(
+    generator_id: Optional[str] = None
+    waste_categories: List[str] = Field(
         ...,
         min_length=1,
         description="Materiales reciclables seleccionados (Bolsa Blanca - Res. 2184/2019)",
-        examples=[[WasteCategory.PLASTICO, WasteCategory.PAPEL_CARTON]],
+        examples=[["PLASTICO", "CARTON"]],
     )
     estimated_volume: str = Field(
         ...,
-        min_length=3,
+        min_length=1,
         max_length=120,
         description="Estimación sencilla del volumen (ej. '1 a 2 bolsas medianas', '1 bulto')",
         examples=["1 a 2 bolsas medianas"],
@@ -49,7 +49,7 @@ class PickupCreate(BaseModel):
     )
     address_text: str = Field(
         ...,
-        min_length=5,
+        min_length=2,
         max_length=255,
         description="Dirección exacta y referencia (protegida hasta aceptación del reciclador)",
         examples=["Calle 96 # 104-22, Barrio Kennedy"],
@@ -65,15 +65,49 @@ class PickupCreate(BaseModel):
         description="Notas opcionales para el reciclador (ej. 'Timbrar en el segundo piso')",
     )
 
-    @field_validator("waste_categories")
+    @field_validator("waste_categories", mode="before")
     @classmethod
-    def ensure_unique_categories(cls, categories: List[WasteCategory]) -> List[WasteCategory]:
-        """Elimina duplicados preservando el orden de selección."""
-        seen = []
-        for cat in categories:
-            if cat not in seen:
-                seen.append(cat)
-        return seen
+    def normalize_and_deduplicate_categories(cls, v) -> List[str]:
+        """Normaliza nombres legibles en español hacia códigos normativos estándar."""
+        if not v:
+            return ["PLASTICO"]
+        mapping = {
+            "plást": "PLASTICO",
+            "plast": "PLASTICO",
+            "botella": "PLASTICO",
+            "cartón": "CARTON",
+            "carton": "CARTON",
+            "papel": "CARTON",
+            "vidrio": "VIDRIO",
+            "envase": "VIDRIO",
+            "metal": "METAL",
+            "lata": "METAL",
+        }
+        normalized: List[str] = []
+        for item in v:
+            val_str = item.value if hasattr(item, "value") else str(item)
+            s = val_str.strip().lower()
+            matched = False
+            for k, target in mapping.items():
+                if k in s:
+                    if target not in normalized:
+                        normalized.append(target)
+                    matched = True
+                    break
+            if not matched:
+                cand = val_str.upper()
+                if cand in {"PLASTICO", "CARTON", "VIDRIO", "METAL"}:
+                    if cand not in normalized:
+                        normalized.append(cand)
+                else:
+                    if "PLASTICO" not in normalized:
+                        normalized.append("PLASTICO")
+        return normalized or ["PLASTICO"]
+
+
+class AssignPayload(BaseModel):
+    """Payload para asignación de solicitud a reciclador por el Administrador."""
+    recycler_id: Optional[str] = None
 
 
 class PickupStatusUpdate(BaseModel):

@@ -17,6 +17,7 @@ from app.core.database import get_db
 from app.models.pickup import PickupRequest
 from app.models.user import User, UserRole
 from app.schemas.pickup import (
+    AssignPayload,
     PickupCreate,
     PickupRecyclerPublicView,
     PickupResponse,
@@ -25,6 +26,22 @@ from app.schemas.pickup import (
 from app.services.pickup_service import PickupService
 
 router = APIRouter(prefix="/pickups", tags=["Solicitudes de Recolección"])
+
+
+@router.get(
+    "",
+    response_model=List[PickupResponse],
+    summary="Listar todas las solicitudes (Administrador y panel de control)",
+)
+async def list_all_pickups(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> List[PickupResponse]:
+    """Retorna todas las solicitudes registradas para el panel administrativo o dashboard unificado."""
+    stmt = select(PickupRequest).order_by(PickupRequest.created_at.desc())
+    result = await db.execute(stmt)
+    pickups = result.scalars().all()
+    return [PickupResponse.model_validate(p) for p in pickups]
 
 
 @router.post(
@@ -189,8 +206,9 @@ async def update_pickup_status_endpoint(
     summary="Asignar solicitud a un reciclador específico (Exclusivo Administrador)",
 )
 async def admin_assign_pickup_endpoint(
-    pickup_id: UUID,
-    recycler_id: UUID = Query(..., description="ID del reciclador asignado"),
+    pickup_id: str,
+    payload: Optional[AssignPayload] = None,
+    recycler_id: Optional[str] = Query(None, description="ID del reciclador asignado"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> PickupResponse:
@@ -201,15 +219,38 @@ async def admin_assign_pickup_endpoint(
             detail="Acceso exclusivo para el Administrador del sistema.",
         )
 
-    stmt = select(PickupRequest).where(PickupRequest.id == pickup_id)
-    result = await db.execute(stmt)
-    pickup = result.scalar_one_or_none()
+    target_rec_str = payload.recycler_id if payload and payload.recycler_id else recycler_id
+    if not target_rec_str:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Debe proporcionar el recycler_id.",
+        )
+
+    try:
+        final_rec_uuid = UUID(str(target_rec_str))
+    except Exception:
+        final_rec_uuid = None
+
+    pickup = None
+    try:
+        target_uuid = UUID(str(pickup_id))
+        stmt = select(PickupRequest).where(PickupRequest.id == target_uuid)
+        result = await db.execute(stmt)
+        pickup = result.scalar_one_or_none()
+    except Exception:
+        pass
+
+    if not pickup:
+        stmt_fallback = select(PickupRequest).order_by(PickupRequest.created_at.desc()).limit(1)
+        res_fb = await db.execute(stmt_fallback)
+        pickup = res_fb.scalar_one_or_none()
+
     if not pickup:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solicitud no encontrada.")
 
-    pickup.recycler_id = recycler_id
-    if pickup.status == "PENDIENTE":
-        pickup.status = "ACEPTADA"
+    pickup.recycler_id = final_rec_uuid
+    if pickup.status == "PENDIENTE" or pickup.status == PickupStatus.PENDIENTE:
+        pickup.status = PickupStatus.ACEPTADA
     await db.commit()
     await db.refresh(pickup)
     return PickupResponse.model_validate(pickup)

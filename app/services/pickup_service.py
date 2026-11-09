@@ -105,7 +105,7 @@ class PickupService:
         new_pickup = PickupRequest(
             generator_id=generator.id,
             status=PickupStatus.PENDIENTE,
-            waste_categories=[cat.value for cat in payload.waste_categories],
+            waste_categories=[cat.value if hasattr(cat, "value") else str(cat) for cat in payload.waste_categories],
             estimated_volume=payload.estimated_volume,
             latitude=payload.latitude,
             longitude=payload.longitude,
