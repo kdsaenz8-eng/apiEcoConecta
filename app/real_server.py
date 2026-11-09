@@ -12,41 +12,64 @@ import os
 import sqlite3
 import sys
 import time
+import base64
+import hmac
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-import jwt
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "..", "ecoconecta.db")
 WEB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "web"))
 
 SECRET_SALT = b"ecoconecta_ecoconecta_secure_salt_2026"
 JWT_SECRET_KEY = "ecoconecta_super_secret_jwt_key_2026_municipio"
-JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
 def hash_pw(password: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), SECRET_SALT, 100000).hex()
 
+def _base64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('utf-8')
+
+def _base64url_decode(data: str) -> bytes:
+    padding = '=' * (4 - (len(data) % 4))
+    return base64.urlsafe_b64decode(data + padding)
+
 def generate_jwt_token(user_id: str, email: str, role: str) -> str:
-    """Genera un token JWT estándar RFC 7519 criptográficamente firmado."""
-    now = datetime.now(timezone.utc)
+    """Genera un token JWT estándar RFC 7519 HS256 sin dependencias externas."""
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT"}
     payload = {
         "sub": str(user_id),
         "email": email,
         "role": role,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(hours=JWT_EXPIRATION_HOURS)).timestamp()),
+        "iat": now,
+        "exp": now + (JWT_EXPIRATION_HOURS * 3600),
         "iss": "EcoConecta Platform"
     }
-    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    h_bytes = _base64url_encode(json.dumps(header, separators=(',', ':')).encode('utf-8'))
+    p_bytes = _base64url_encode(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
+    signing_input = f"{h_bytes}.{p_bytes}".encode('utf-8')
+    sig = _base64url_encode(hmac.new(JWT_SECRET_KEY.encode('utf-8'), signing_input, hashlib.sha256).digest())
+    return f"{h_bytes}.{p_bytes}.{sig}"
 
 def verify_jwt_token(token: str) -> dict:
-    """Verifica y decodifica un token JWT criptográfico."""
+    """Verifica y decodifica un token JWT criptográfico estándar RFC 7519."""
     try:
-        return jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-    except Exception as e:
+        parts = token.split('.')
+        if len(parts) != 3:
+            return None
+        h_bytes, p_bytes, sig = parts
+        signing_input = f"{h_bytes}.{p_bytes}".encode('utf-8')
+        expected_sig = _base64url_encode(hmac.new(JWT_SECRET_KEY.encode('utf-8'), signing_input, hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        payload = json.loads(_base64url_decode(p_bytes).decode('utf-8'))
+        if payload.get("exp", 0) < int(time.time()):
+            return None
+        return payload
+    except Exception:
         return None
 
 def init_real_database():
@@ -164,6 +187,51 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
+    def _authenticate_request(self) -> dict:
+        """
+        Valida que la petición contenga un token JWT RFC 7519 válido en el header:
+        Authorization: Bearer <token>
+        Las únicas rutas públicas del sistema son POST /api/v1/auth/login, POST /api/v1/auth/register y GET /api/v1/health.
+        Todas las demás rutas exigen token JWT válido o son rechazadas con HTTP 401 Unauthorized.
+        """
+        auth_header = self.headers.get("Authorization", "").strip()
+        if not auth_header:
+            print(f"[SECURITY 401 REJECT] Acceso no autorizado a '{self.path}': Header Authorization ausente.")
+            self._set_json_headers(401)
+            self.wfile.write(json.dumps({
+                "detail": "No autenticado. Token JWT requerido para acceder a este recurso municipal."
+            }).encode("utf-8"))
+            return None
+
+        if not auth_header.startswith("Bearer "):
+            print(f"[SECURITY 401 REJECT] Acceso no autorizado a '{self.path}': Formato de autorización no es Bearer.")
+            self._set_json_headers(401)
+            self.wfile.write(json.dumps({
+                "detail": "Formato de autorización inválido. Debe usar 'Bearer <token>'."
+            }).encode("utf-8"))
+            return None
+
+        parts = auth_header.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            self._set_json_headers(401)
+            self.wfile.write(json.dumps({
+                "detail": "Token JWT ausente tras prefijo Bearer."
+            }).encode("utf-8"))
+            return None
+
+        token = parts[1].strip()
+        payload = verify_jwt_token(token)
+        if not payload:
+            print(f"[SECURITY 401 REJECT] Acceso no autorizado a '{self.path}': Token JWT expirado o firma criptográfica no válida.")
+            self._set_json_headers(401)
+            self.wfile.write(json.dumps({
+                "detail": "Token JWT expirado o no autorizado. Por favor inicia sesión nuevamente."
+            }).encode("utf-8"))
+            return None
+
+        print(f"[SECURITY 200 PASS] Acceso concedido a '{self.path}' para {payload.get('email')} (Rol: {payload.get('role')})")
+        return payload
+
     def do_OPTIONS(self):
         self._set_json_headers(200)
 
@@ -171,6 +239,7 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        # 1. Healthcheck público del sistema (monitoreo y balanceadores)
         if path == "/api/v1/health":
             self._set_json_headers(200)
             self.wfile.write(json.dumps({
@@ -182,91 +251,129 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
             }).encode("utf-8"))
             return
 
-        elif path in ["/api/v1/pickups", "/api/v1/pickups/pending"]:
-            conn = sqlite3.connect(DB_FILE)
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute("""
-            SELECT p.*, g.full_name as generator_name, g.phone as generator_phone, g.neighborhood,
-                   r.full_name as recycler_name
-            FROM pickup_requests p
-            JOIN users g ON p.generator_id = g.id
-            LEFT JOIN users r ON p.recycler_id = r.id
-            ORDER BY p.created_at DESC
-            """)
-            rows = c.fetchall()
-            results = []
-            for r in rows:
-                results.append({
-                    "id": r["id"],
-                    "generator_id": r["generator_id"],
-                    "generator_name": r["generator_name"],
-                    "generator_phone": r["generator_phone"],
-                    "neighborhood": r["neighborhood"],
-                    "address_text": r["address_text"],
-                    "waste_categories": json.loads(r["waste_categories"]) if r["waste_categories"].startswith("[") else [r["waste_categories"]],
-                    "estimated_volume": r["estimated_volume"],
-                    "latitude": float(r["latitude"]),
-                    "longitude": float(r["longitude"]),
-                    "status": r["status"],
-                    "photo_url": r["photo_url"],
-                    "notes": r["notes"],
-                    "recycler_id": r["recycler_id"],
-                    "recycler_name": r["recycler_name"] or "Pendiente de asignar",
-                    "created_at": r["created_at"],
-                    "accepted_at": r["accepted_at"],
-                    "completed_at": r["completed_at"]
-                })
-            conn.close()
-            self._set_json_headers(200)
-            self.wfile.write(json.dumps(results).encode("utf-8"))
-            return
+        # 2. TODAS las demás rutas de API (/api/v1/...) DEBEN tener autenticación JWT
+        if path.startswith("/api/v1/"):
+            user = self._authenticate_request()
+            if not user:
+                return
 
-        elif path == "/api/v1/metrics/pgirs-summary":
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("SELECT role, count(*) FROM users GROUP BY role")
-            users_by_role = dict(c.fetchall())
-            c.execute("SELECT status, count(*) FROM pickup_requests GROUP BY status")
-            pickups_by_status = dict(c.fetchall())
-            c.execute("SELECT count(*) FROM audit_logs")
-            total_audits = c.fetchone()[0]
-            conn.close()
+            if path == "/api/v1/auth/me":
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("SELECT id, full_name, email, phone, role, neighborhood, address_reference FROM users WHERE id = ?", (user.get("sub"),))
+                u = c.fetchone()
+                conn.close()
+                if u:
+                    self._set_json_headers(200)
+                    self.wfile.write(json.dumps(dict(u)).encode("utf-8"))
+                else:
+                    self._set_json_headers(404)
+                    self.wfile.write(json.dumps({"detail": "Usuario no encontrado."}).encode("utf-8"))
+                return
 
-            self._set_json_headers(200)
-            self.wfile.write(json.dumps({
-                "municipality": "Antioquia",
-                "users_by_role": users_by_role,
-                "pickups_by_status": pickups_by_status,
-                "total_audits": total_audits,
-                "real_database": True
-            }).encode("utf-8"))
-            return
+            elif path in ["/api/v1/pickups", "/api/v1/pickups/pending", "/api/v1/pickups/my-requests"]:
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("""
+                SELECT p.*, g.full_name as generator_name, g.phone as generator_phone, g.neighborhood,
+                       r.full_name as recycler_name
+                FROM pickup_requests p
+                JOIN users g ON p.generator_id = g.id
+                LEFT JOIN users r ON p.recycler_id = r.id
+                ORDER BY p.created_at DESC
+                """)
+                rows = c.fetchall()
+                results = []
+                for r in rows:
+                    results.append({
+                        "id": r["id"],
+                        "generator_id": r["generator_id"],
+                        "generator_name": r["generator_name"],
+                        "generator_phone": r["generator_phone"],
+                        "neighborhood": r["neighborhood"],
+                        "address_text": r["address_text"],
+                        "waste_categories": json.loads(r["waste_categories"]) if r["waste_categories"].startswith("[") else [r["waste_categories"]],
+                        "estimated_volume": r["estimated_volume"],
+                        "latitude": float(r["latitude"]),
+                        "longitude": float(r["longitude"]),
+                        "status": r["status"],
+                        "photo_url": r["photo_url"],
+                        "notes": r["notes"],
+                        "recycler_id": r["recycler_id"],
+                        "recycler_name": r["recycler_name"] or "Pendiente de asignar",
+                        "created_at": r["created_at"],
+                        "accepted_at": r["accepted_at"],
+                        "completed_at": r["completed_at"]
+                    })
+                conn.close()
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps(results).encode("utf-8"))
+                return
 
-        elif path == "/api/v1/users/recyclers":
-            conn = sqlite3.connect(DB_FILE)
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            c.execute("SELECT id, full_name, neighborhood, user_type_detail FROM users WHERE role = 'RECICLADOR'")
-            rows = c.fetchall()
-            recyclers = [
-                {
-                    "id": r["id"],
-                    "nombre": r["full_name"],
-                    "name": r["full_name"],
-                    "full_name": r["full_name"],
-                    "sector": f"Barrio {r['neighborhood']}",
-                    "neighborhood": r["neighborhood"],
-                    "user_type_detail": r["user_type_detail"]
-                }
-                for r in rows
-            ]
-            conn.close()
-            self._set_json_headers(200)
-            self.wfile.write(json.dumps(recyclers).encode("utf-8"))
-            return
+            elif path == "/api/v1/audit/logs":
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 50")
+                rows = c.fetchall()
+                logs = [dict(r) for r in rows]
+                conn.close()
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps(logs).encode("utf-8"))
+                return
 
-        # Servir archivos estáticos del frontend
+            elif path == "/api/v1/metrics/pgirs-summary":
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("SELECT role, count(*) FROM users GROUP BY role")
+                users_by_role = dict(c.fetchall())
+                c.execute("SELECT status, count(*) FROM pickup_requests GROUP BY status")
+                pickups_by_status = dict(c.fetchall())
+                c.execute("SELECT count(*) FROM audit_logs")
+                total_audits = c.fetchone()[0]
+                conn.close()
+
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps({
+                    "municipality": "Antioquia",
+                    "users_by_role": users_by_role,
+                    "pickups_by_status": pickups_by_status,
+                    "total_audits": total_audits,
+                    "real_database": True
+                }).encode("utf-8"))
+                return
+
+            elif path == "/api/v1/users/recyclers":
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("SELECT id, full_name, neighborhood, user_type_detail FROM users WHERE role = 'RECICLADOR'")
+                rows = c.fetchall()
+                recyclers = [
+                    {
+                        "id": r["id"],
+                        "nombre": r["full_name"],
+                        "name": r["full_name"],
+                        "full_name": r["full_name"],
+                        "sector": f"Barrio {r['neighborhood']}",
+                        "neighborhood": r["neighborhood"],
+                        "user_type_detail": r["user_type_detail"]
+                    }
+                    for r in rows
+                ]
+                conn.close()
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps(recyclers).encode("utf-8"))
+                return
+
+            else:
+                self._set_json_headers(404)
+                self.wfile.write(json.dumps({"detail": f"Ruta protegida '{path}' no encontrada."}).encode("utf-8"))
+                return
+
+        # 3. Servir archivos estáticos del frontend
         super().do_GET()
 
     def do_POST(self):
@@ -279,6 +386,7 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
         except Exception:
             body = {}
 
+        # ÚNICAS RUTAS PÚBLICAS SIN AUTENTICACIÓN JWT: LOGIN Y REGISTER
         if path == "/api/v1/auth/login":
             email = body.get("email", "").strip().lower()
             password = body.get("password", "")
@@ -382,112 +490,153 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
             }).encode("utf-8"))
             return
 
-        # Verificación de JWT Bearer para endpoints protegidos de mutación
-        if path.startswith("/api/v1/pickups"):
-            auth_header = self.headers.get("Authorization", "")
-            if not auth_header.startswith("Bearer "):
-                print(f"[SECURITY REJECT] Missing or invalid Authorization header on {path}")
-                self._set_json_headers(401)
-                self.wfile.write(json.dumps({"detail": "Token JWT ausente o inválido. Inicia sesión para continuar."}).encode("utf-8"))
+        # TODAS LAS DEMÁS RUTAS /api/v1/... EXIGEN OBLIGATORIAMENTE TOKEN JWT VÁLIDO
+        if path.startswith("/api/v1/"):
+            user = self._authenticate_request()
+            if not user:
                 return
-            
-            token = auth_header.split(" ")[1].strip()
-            decoded_token = verify_jwt_token(token)
-            if not decoded_token:
-                print(f"[SECURITY REJECT] JWT token invalid or expired on {path}")
-                self._set_json_headers(401)
-                self.wfile.write(json.dumps({"detail": "Token JWT expirado o no autorizado. Por favor reingresa."}).encode("utf-8"))
+
+            if path == "/api/v1/pickups":
+                # Inserción real en base de datos con coordenadas exactas
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                now = datetime.now(timezone.utc).isoformat()
+                pickup_id = f"SOL-{str(int(time.time()))[-4:]}"
+
+                # Asociar al usuario autenticado (o el generator_id si es admin)
+                gen_id = body.get("generator_id") or user.get("sub")
+
+                lat_exacta = float(body.get("latitude", 7.666925))
+                lon_exacta = float(body.get("longitude", -76.681140))
+
+                c.execute("""
+                INSERT INTO pickup_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    pickup_id,
+                    gen_id,
+                    None,
+                    "Pendiente",
+                    json.dumps(body.get("waste_categories", ["Plástico y Botellas"])),
+                    body.get("estimated_volume", "1 o 2 bolsas medianas"),
+                    lat_exacta,
+                    lon_exacta,
+                    body.get("address_text", "Calle 98 # 102-15, Barrio Kennedy"),
+                    body.get("photo_url", "https://images.unsplash.com/photo-1532996122724-e3c354a0b15b?auto=format&fit=crop&w=600&q=80"),
+                    body.get("notes", ""),
+                    now,
+                    None,
+                    None
+                ))
+                conn.commit()
+                conn.close()
+
+                self._set_json_headers(201)
+                self.wfile.write(json.dumps({
+                    "id": pickup_id,
+                    "status": "Pendiente",
+                    "latitude": lat_exacta,
+                    "longitude": lon_exacta,
+                    "created_at": now,
+                    "message": "Solicitud almacenada con éxito en la base de datos real."
+                }).encode("utf-8"))
                 return
-            print(f"[SECURITY PASS] Authorized request by {decoded_token.get('email')} (Role: {decoded_token.get('role')})")
 
-        if path == "/api/v1/pickups":
-            # Inserción real en base de datos con coordenadas exactas
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            now = datetime.now(timezone.utc).isoformat()
-            pickup_id = f"SOL-{str(int(time.time()))[-4:]}"
+            elif "/assign" in path or "/claim" in path:
+                # Formato: /api/v1/pickups/<id>/assign o /api/v1/pickups/<id>/claim
+                parts = path.split("/")
+                p_id = parts[4] if len(parts) > 4 else None
+                rec_id = body.get("recycler_id") or user.get("sub")
+                now = datetime.now(timezone.utc).isoformat()
 
-            # Obtener generador
-            gen_id = body.get("generator_id")
-            if not gen_id:
-                c.execute("SELECT id FROM users WHERE role = 'GENERADOR' LIMIT 1")
-                row = c.fetchone()
-                gen_id = row[0] if row else str(uuid.uuid4())
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("""
+                UPDATE pickup_requests
+                SET recycler_id = ?, status = 'Aceptada', accepted_at = ?
+                WHERE id = ?
+                """, (rec_id, now, p_id))
+                conn.commit()
+                conn.close()
 
-            lat_exacta = float(body.get("latitude", 7.666925))
-            lon_exacta = float(body.get("longitude", -76.681140))
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps({"id": p_id, "recycler_id": rec_id, "status": "Aceptada"}).encode("utf-8"))
+                return
 
-            c.execute("""
-            INSERT INTO pickup_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                pickup_id,
-                gen_id,
-                None,
-                "Pendiente",
-                json.dumps(body.get("waste_categories", ["Plástico y Botellas"])),
-                body.get("estimated_volume", "1 o 2 bolsas medianas"),
-                lat_exacta,
-                lon_exacta,
-                body.get("address_text", "Calle 98 # 102-15, Barrio Kennedy"),
-                body.get("photo_url", "https://images.unsplash.com/photo-1532996122724-e3c354a0b15b?auto=format&fit=crop&w=600&q=80"),
-                body.get("notes", ""),
-                now,
-                None,
-                None
-            ))
-            conn.commit()
-            conn.close()
+            elif "/status" in path:
+                parts = path.split("/")
+                p_id = parts[4] if len(parts) > 4 else None
+                nuevo_estado = body.get("status", "Completada")
+                now = datetime.now(timezone.utc).isoformat()
 
-            self._set_json_headers(201)
-            self.wfile.write(json.dumps({
-                "id": pickup_id,
-                "status": "Pendiente",
-                "latitude": lat_exacta,
-                "longitude": lon_exacta,
-                "created_at": now,
-                "message": "Solicitud almacenada con éxito en la base de datos real."
-            }).encode("utf-8"))
-            return
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                if nuevo_estado == "Completada":
+                    c.execute("UPDATE pickup_requests SET status = ?, completed_at = ? WHERE id = ?", (nuevo_estado, now, p_id))
+                else:
+                    c.execute("UPDATE pickup_requests SET status = ? WHERE id = ?", (nuevo_estado, p_id))
+                conn.commit()
+                conn.close()
 
-        elif "/assign" in path:
-            # Formato: /api/v1/pickups/<id>/assign
-            parts = path.split("/")
-            p_id = parts[4] if len(parts) > 4 else None
-            rec_id = body.get("recycler_id")
-            now = datetime.now(timezone.utc).isoformat()
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps({"id": p_id, "status": nuevo_estado}).encode("utf-8"))
+                return
 
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("""
-            UPDATE pickup_requests
-            SET recycler_id = ?, status = 'Aceptada', accepted_at = ?
-            WHERE id = ?
-            """, (rec_id, now, p_id))
-            conn.commit()
-            conn.close()
+        self._set_json_headers(404)
+        self.wfile.write(json.dumps({"detail": "Ruta no encontrada."}).encode("utf-8"))
 
-            self._set_json_headers(200)
-            self.wfile.write(json.dumps({"id": p_id, "recycler_id": rec_id, "status": "Aceptada"}).encode("utf-8"))
-            return
+    def do_PATCH(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            body = {}
 
-        elif "/status" in path:
-            parts = path.split("/")
-            p_id = parts[4] if len(parts) > 4 else None
-            nuevo_estado = body.get("status", "Completada")
-            now = datetime.now(timezone.utc).isoformat()
+        if path.startswith("/api/v1/"):
+            user = self._authenticate_request()
+            if not user:
+                return
 
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            if nuevo_estado == "Completada":
-                c.execute("UPDATE pickup_requests SET status = ?, completed_at = ? WHERE id = ?", (nuevo_estado, now, p_id))
-            else:
-                c.execute("UPDATE pickup_requests SET status = ? WHERE id = ?", (nuevo_estado, p_id))
-            conn.commit()
-            conn.close()
+            if "/assign" in path or "/claim" in path:
+                parts = path.split("/")
+                p_id = parts[4] if len(parts) > 4 else None
+                rec_id = body.get("recycler_id") or user.get("sub")
+                now = datetime.now(timezone.utc).isoformat()
 
-            self._set_json_headers(200)
-            self.wfile.write(json.dumps({"id": p_id, "status": nuevo_estado}).encode("utf-8"))
-            return
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("""
+                UPDATE pickup_requests
+                SET recycler_id = ?, status = 'Aceptada', accepted_at = ?
+                WHERE id = ?
+                """, (rec_id, now, p_id))
+                conn.commit()
+                conn.close()
+
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps({"id": p_id, "recycler_id": rec_id, "status": "Aceptada"}).encode("utf-8"))
+                return
+
+            elif "/status" in path:
+                parts = path.split("/")
+                p_id = parts[4] if len(parts) > 4 else None
+                nuevo_estado = body.get("status", "Completada")
+                now = datetime.now(timezone.utc).isoformat()
+
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                if nuevo_estado == "Completada":
+                    c.execute("UPDATE pickup_requests SET status = ?, completed_at = ? WHERE id = ?", (nuevo_estado, now, p_id))
+                else:
+                    c.execute("UPDATE pickup_requests SET status = ? WHERE id = ?", (nuevo_estado, p_id))
+                conn.commit()
+                conn.close()
+
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps({"id": p_id, "status": nuevo_estado}).encode("utf-8"))
+                return
 
         self._set_json_headers(404)
         self.wfile.write(json.dumps({"detail": "Ruta no encontrada."}).encode("utf-8"))

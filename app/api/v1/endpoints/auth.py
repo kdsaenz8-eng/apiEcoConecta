@@ -175,7 +175,7 @@ async def login_user(
 
     access_token = create_access_token(
         subject=str(user.id),
-        role=user.role.value,
+        role=user.role.value if hasattr(user.role, "value") else str(user.role),
     )
     return TokenResponse(
         access_token=access_token,
