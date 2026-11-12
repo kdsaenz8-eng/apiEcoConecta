@@ -596,7 +596,7 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                 lon_exacta = float(body.get("longitude", -76.681140))
 
                 photo_raw = body.get("photo_url")
-                photo_final = save_base64_image(photo_raw) or photo_raw or "https://images.unsplash.com/photo-1532996122724-e3c354a0b15b?auto=format&fit=crop&w=600&q=80"
+                photo_final = save_base64_image(photo_raw) or (photo_raw.strip() if photo_raw and isinstance(photo_raw, str) and photo_raw.strip() else None)
 
                 c.execute("""
                 INSERT INTO pickup_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -609,7 +609,7 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                     body.get("estimated_volume", "1 o 2 bolsas medianas"),
                     lat_exacta,
                     lon_exacta,
-                    body.get("address_text", "Calle 98 # 102-15, Barrio Kennedy"),
+                    body.get("address_text", "").strip(),
                     photo_final,
                     body.get("notes", ""),
                     now,
