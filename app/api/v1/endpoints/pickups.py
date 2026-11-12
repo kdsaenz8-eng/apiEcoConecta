@@ -5,7 +5,9 @@ Implementa:
 - HU-04: Bandeja georreferenciada con cálculo de distancia, protección de datos personales
   (Ley 1581/2012) y reclamo atómico con control de concurrencia (SELECT FOR UPDATE).
 """
+from datetime import datetime, timezone
 from typing import List, Optional
+import uuid
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -14,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.endpoints.auth import get_current_active_user
 from app.core.database import get_db
-from app.models.pickup import PickupRequest
+from app.models.audit_log import AuditLog
+from app.models.pickup import PickupRequest, PickupStatus
 from app.models.user import User, UserRole
 from app.schemas.pickup import (
     AssignPayload,
@@ -224,7 +227,8 @@ async def admin_assign_pickup_endpoint(
     current_user: User = Depends(get_current_active_user),
 ) -> PickupResponse:
     """Permite al rol ADMINISTRADOR reasignar o despachar una solicitud a cualquier reciclador."""
-    if current_user.role != UserRole.ADMINISTRADOR:
+    user_role_str = current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role)
+    if user_role_str.upper() != "ADMINISTRADOR" and current_user.role != UserRole.ADMINISTRADOR:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Acceso exclusivo para el Administrador del sistema.",
@@ -237,14 +241,34 @@ async def admin_assign_pickup_endpoint(
             detail="Debe proporcionar el recycler_id.",
         )
 
+    # 1. Búsqueda y validación estricta de la existencia del reciclador
+    rec_user = None
     try:
-        final_rec_uuid = UUID(str(target_rec_str))
+        rec_uuid = UUID(str(target_rec_str).strip())
+        stmt_rec = select(User).where(User.id == rec_uuid)
+        res_rec = await db.execute(stmt_rec)
+        rec_user = res_rec.scalar_one_or_none()
     except Exception:
-        final_rec_uuid = None
+        pass
 
+    if not rec_user:
+        stmt_rec_alt = select(User).where(
+            (User.role == UserRole.RECICLADOR) &
+            ((User.email == str(target_rec_str).strip().lower()) | (User.full_name == str(target_rec_str).strip()))
+        )
+        res_rec_alt = await db.execute(stmt_rec_alt)
+        rec_user = res_rec_alt.scalar_one_or_none()
+
+    if not rec_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Reciclador con ID '{target_rec_str}' no encontrado en el sistema.",
+        )
+
+    # 2. Búsqueda de la solicitud por UUID o prefijo
     pickup = None
     try:
-        target_uuid = UUID(str(pickup_id))
+        target_uuid = UUID(str(pickup_id).strip())
         stmt = select(PickupRequest).where(PickupRequest.id == target_uuid)
         result = await db.execute(stmt)
         pickup = result.scalar_one_or_none()
@@ -252,16 +276,35 @@ async def admin_assign_pickup_endpoint(
         pass
 
     if not pickup:
-        stmt_fallback = select(PickupRequest).order_by(PickupRequest.created_at.desc()).limit(1)
-        res_fb = await db.execute(stmt_fallback)
-        pickup = res_fb.scalar_one_or_none()
+        stmt_all = select(PickupRequest).order_by(PickupRequest.created_at.desc())
+        res_all = await db.execute(stmt_all)
+        for p in res_all.scalars().all():
+            if str(p.id) == str(pickup_id).strip() or str(p.id).startswith(str(pickup_id).strip()):
+                pickup = p
+                break
 
     if not pickup:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solicitud no encontrada.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Solicitud de recolección '{pickup_id}' no encontrada.",
+        )
 
-    pickup.recycler_id = final_rec_uuid
-    if pickup.status == "PENDIENTE" or pickup.status == PickupStatus.PENDIENTE:
-        pickup.status = PickupStatus.ACEPTADA
+    # 3. Transición de estado a ACEPTADA y asignación de reciclador
+    now = datetime.now(timezone.utc)
+    pickup.recycler_id = rec_user.id
+    pickup.status = PickupStatus.ACEPTADA
+    pickup.accepted_at = now
+
+    audit_entry = AuditLog(
+        id=uuid.uuid4(),
+        user_id=current_user.id,
+        event_type="ADMIN_ASSIGN_RECYCLER",
+        policy_version="v1.0-2026-PGIRS",
+        details=f"Solicitud {pickup.id} asignada por Administrador ({current_user.email}) al reciclador {rec_user.full_name} ({rec_user.id}).",
+        created_at=now,
+    )
+    db.add(audit_entry)
+
     await db.commit()
     await db.refresh(pickup)
     return PickupResponse.model_validate(pickup)

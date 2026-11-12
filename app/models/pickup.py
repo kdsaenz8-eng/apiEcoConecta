@@ -159,3 +159,24 @@ class PickupRequest(Base):
         allowed = VALID_STATUS_TRANSITIONS.get(self.status, set())
         return new_status in allowed
 
+    @property
+    def generator_name(self) -> Optional[str]:
+        """Nombre del generador asociado para enriquecimiento de vistas."""
+        return self.generator.full_name if self.generator else None
+
+    @property
+    def generator_phone(self) -> Optional[str]:
+        """Teléfono de contacto del generador para reciclador asignado o admin."""
+        return self.generator.phone if self.generator else None
+
+    @property
+    def neighborhood(self) -> Optional[str]:
+        """Barrio o comuna del generador."""
+        return self.generator.neighborhood if self.generator else None
+
+    @property
+    def recycler_name(self) -> Optional[str]:
+        """Nombre del reciclador asignado, o None si está pendiente."""
+        return self.recycler.full_name if self.recycler else None
+
+

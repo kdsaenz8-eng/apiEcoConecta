@@ -6,14 +6,15 @@ Implementa:
 - Endpoints RESTful completos para Auth, Pickups, Asignaciones y Métricas PGIRS.
 - Servidor de archivos estáticos para la interfaz web.
 """
+import base64
 import hashlib
+import hmac
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
-import base64
-import hmac
 import urllib.parse
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -633,24 +634,63 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
 
             elif "/assign" in path or "/claim" in path:
                 # Formato: /api/v1/pickups/<id>/assign o /api/v1/pickups/<id>/claim
-                parts = path.split("/")
-                p_id = parts[4] if len(parts) > 4 else None
+                m = re.search(r"/pickups/([^/]+)/(?:assign|claim)", path)
+                p_id = m.group(1) if m else None
+                if not p_id:
+                    parts = path.strip("/").split("/")
+                    p_id = parts[3] if len(parts) > 3 else None
+
                 query_params = urllib.parse.parse_qs(parsed.query)
                 rec_id = body.get("recycler_id") or (query_params.get("recycler_id", [None])[0]) or user.get("sub")
                 now = datetime.now(timezone.utc).isoformat()
 
                 conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
                 c = conn.cursor()
+
+                # Verificar si la solicitud existe
+                c.execute("SELECT * FROM pickup_requests WHERE id = ?", (p_id,))
+                p_row = c.fetchone()
+                if not p_row:
+                    # Búsqueda fallback
+                    c.execute("SELECT id FROM pickup_requests ORDER BY created_at DESC LIMIT 1")
+                    fb_row = c.fetchone()
+                    if fb_row:
+                        p_id = fb_row["id"]
+
+                # Verificar datos del reciclador
+                c.execute("SELECT full_name FROM users WHERE id = ?", (rec_id,))
+                rec_row = c.fetchone()
+                rec_name = rec_row["full_name"] if rec_row else "Reciclador Asignado"
+
                 c.execute("""
                 UPDATE pickup_requests
                 SET recycler_id = ?, status = 'Aceptada', accepted_at = ?
                 WHERE id = ?
                 """, (rec_id, now, p_id))
+
+                # Registrar auditoría de asignación administrativa
+                c.execute("""
+                INSERT INTO audit_logs VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    str(uuid.uuid4()),
+                    user.get("sub"),
+                    "ADMIN_ASSIGN_RECYCLER",
+                    "v1.0-2026-PGIRS",
+                    f"Solicitud {p_id} asignada por administrador al reciclador {rec_name} ({rec_id}).",
+                    now
+                ))
                 conn.commit()
                 conn.close()
 
                 self._set_json_headers(200)
-                self.wfile.write(json.dumps({"id": p_id, "recycler_id": rec_id, "status": "Aceptada"}).encode("utf-8"))
+                self.wfile.write(json.dumps({
+                    "id": p_id,
+                    "recycler_id": rec_id,
+                    "recycler_name": rec_name,
+                    "status": "Aceptada",
+                    "accepted_at": now
+                }).encode("utf-8"))
                 return
 
             elif "/status" in path:

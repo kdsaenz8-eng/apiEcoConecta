@@ -108,6 +108,9 @@ class PickupCreate(BaseModel):
 class AssignPayload(BaseModel):
     """Payload para asignación de solicitud a reciclador por el Administrador."""
     recycler_id: Optional[str] = None
+    status: Optional[str] = None
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class PickupStatusUpdate(BaseModel):
@@ -141,6 +144,12 @@ class PickupResponse(BaseModel):
     created_at: datetime
     accepted_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+
+    # Campos enriquecidos para despliegue directo en paneles sin consultas N+1
+    generator_name: Optional[str] = None
+    generator_phone: Optional[str] = None
+    neighborhood: Optional[str] = None
+    recycler_name: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
