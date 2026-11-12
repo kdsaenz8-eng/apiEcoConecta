@@ -700,9 +700,18 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                 return
 
             elif "/status" in path:
-                parts = path.split("/")
-                p_id = parts[4] if len(parts) > 4 else None
-                nuevo_estado = body.get("status", "Completada")
+                m = re.search(r"/pickups/([^/]+)/status", path)
+                p_id = m.group(1) if m else (parts[4] if len(parts) > 4 else None)
+                raw_st = body.get("status", "Completada")
+                st_upper = str(raw_st).strip().upper().replace(" ", "_")
+                if st_upper in {"EN_RUTA", "RUTA", "EN_CAMINO", "CAMINO"}:
+                    nuevo_estado = "En_Ruta"
+                elif st_upper in {"COMPLETADA", "COMPLETADO", "FINALIZADA"}:
+                    nuevo_estado = "Completada"
+                elif st_upper in {"ACEPTADA", "ACEPTADO", "ASIGNADA"}:
+                    nuevo_estado = "Aceptada"
+                else:
+                    nuevo_estado = raw_st
                 now = datetime.now(timezone.utc).isoformat()
 
                 conn = sqlite3.connect(DB_FILE)
@@ -757,9 +766,18 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                 return
 
             elif "/status" in path:
-                parts = path.split("/")
-                p_id = parts[4] if len(parts) > 4 else None
-                nuevo_estado = body.get("status", "Completada")
+                m = re.search(r"/pickups/([^/]+)/status", path)
+                p_id = m.group(1) if m else (parts[4] if len(parts) > 4 else None)
+                raw_st = body.get("status", "Completada")
+                st_upper = str(raw_st).strip().upper().replace(" ", "_")
+                if st_upper in {"EN_RUTA", "RUTA", "EN_CAMINO", "CAMINO"}:
+                    nuevo_estado = "En_Ruta"
+                elif st_upper in {"COMPLETADA", "COMPLETADO", "FINALIZADA"}:
+                    nuevo_estado = "Completada"
+                elif st_upper in {"ACEPTADA", "ACEPTADO", "ASIGNADA"}:
+                    nuevo_estado = "Aceptada"
+                else:
+                    nuevo_estado = raw_st
                 now = datetime.now(timezone.utc).isoformat()
 
                 conn = sqlite3.connect(DB_FILE)

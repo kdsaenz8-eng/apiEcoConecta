@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from app.models.pickup import PickupRequest, PickupStatus
 from app.models.user import User, UserRole
-from app.schemas.pickup import AssignPayload, PickupResponse
+from app.schemas.pickup import AssignPayload, PickupResponse, PickupStatusUpdate
 
 
 class TestAdminAssignPickupTDD(unittest.TestCase):
@@ -104,6 +104,20 @@ class TestAdminAssignPickupTDD(unittest.TestCase):
         self.assertTrue(is_admin(admin_user))
         self.assertFalse(is_admin(recycler_user))
         self.assertFalse(is_admin(generator_user))
+
+    def test_status_update_normalization_variants(self):
+        """Verifica que PickupStatusUpdate normalice 'En_Ruta', 'En camino', 'Completada', etc."""
+        update_en_ruta = PickupStatusUpdate.model_validate({"status": "En_Ruta"})
+        self.assertEqual(update_en_ruta.status, PickupStatus.EN_CAMINO)
+
+        update_camino = PickupStatusUpdate.model_validate({"status": "En camino"})
+        self.assertEqual(update_camino.status, PickupStatus.EN_CAMINO)
+
+        update_completada = PickupStatusUpdate.model_validate({"status": "Completada"})
+        self.assertEqual(update_completada.status, PickupStatus.COMPLETADA)
+
+        update_aceptada = PickupStatusUpdate.model_validate({"status": "Aceptada"})
+        self.assertEqual(update_aceptada.status, PickupStatus.ACEPTADA)
 
 
 if __name__ == "__main__":

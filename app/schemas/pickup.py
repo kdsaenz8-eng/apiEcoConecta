@@ -126,6 +126,30 @@ class PickupStatusUpdate(BaseModel):
         description="Observación opcional al actualizar el estado",
     )
 
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, v) -> PickupStatus:
+        """Normaliza variantes comunes enviadas desde clientes móviles o web ('En_Ruta', 'En camino', etc.)."""
+        if isinstance(v, PickupStatus):
+            return v
+        if not v:
+            return PickupStatus.PENDIENTE
+        v_str = str(v).strip().upper().replace(" ", "_")
+        if v_str in {"EN_RUTA", "RUTA", "EN_CAMINO", "CAMINO", "EN-CAMINO", "EN-RUTA"}:
+            return PickupStatus.EN_CAMINO
+        if v_str in {"COMPLETADA", "COMPLETADO", "FINALIZADA", "FINALIZADO"}:
+            return PickupStatus.COMPLETADA
+        if v_str in {"ACEPTADA", "ACEPTADO", "ASIGNADA", "ASIGNADO"}:
+            return PickupStatus.ACEPTADA
+        if v_str in {"CANCELADA", "CANCELADO"}:
+            return PickupStatus.CANCELADA
+        if v_str in {"PENDIENTE", "PENDING"}:
+            return PickupStatus.PENDIENTE
+        try:
+            return PickupStatus(v_str)
+        except ValueError:
+            return PickupStatus(v)
+
 
 class PickupResponse(BaseModel):
     """Respuesta completa de una solicitud para su creador o el reciclador asignado."""
@@ -179,9 +203,21 @@ class PickupRecyclerPublicView(BaseModel):
         default=None,
         description="Dirección exacta (SOLO revelada tras reclamo atómico por el reciclador asignado)",
     )
+    address_text: Optional[str] = Field(
+        default=None,
+        description="Alias de exact_address para compatibilidad",
+    )
     generator_phone: Optional[str] = Field(
         default=None,
         description="Teléfono del generador (SOLO revelado al reciclador que aceptó la solicitud)",
+    )
+    generator_name: Optional[str] = Field(
+        default=None,
+        description="Nombre del generador (visible si está asignada)",
+    )
+    recycler_id: Optional[UUID] = Field(
+        default=None,
+        description="ID del reciclador asignado",
     )
     photo_url: Optional[str] = None
     notes: Optional[str] = None
@@ -218,7 +254,10 @@ class PickupRecyclerPublicView(BaseModel):
             approximate_zone=f"Barrio {generator_neighborhood}",
             distance_km=round(distance_km, 2) if distance_km is not None else None,
             exact_address=pickup.address_text if is_assigned_to_current_recycler else None,
+            address_text=pickup.address_text if is_assigned_to_current_recycler else None,
             generator_phone=generator_phone if is_assigned_to_current_recycler else None,
+            generator_name=pickup.generator_name if is_assigned_to_current_recycler else None,
+            recycler_id=pickup.recycler_id,
             photo_url=pickup.photo_url,
             notes=pickup.notes if is_assigned_to_current_recycler else None,
             created_at=pickup.created_at,

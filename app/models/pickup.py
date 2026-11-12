@@ -155,7 +155,9 @@ class PickupRequest(Base):
     )
 
     def can_transition_to(self, new_status: PickupStatus) -> bool:
-        """Verifica en el dominio si la transición de estado solicitada es válida."""
+        """Verifica en el dominio si la transición de estado solicitada es válida e idempotente."""
+        if new_status == self.status:
+            return True
         allowed = VALID_STATUS_TRANSITIONS.get(self.status, set())
         return new_status in allowed
 

@@ -195,6 +195,11 @@ async def claim_pickup_endpoint(
     response_model=PickupResponse,
     summary="Actualizar estado de la solicitud (EN_CAMINO, COMPLETADA, CANCELADA)",
 )
+@router.post(
+    "/{pickup_id}/status",
+    response_model=PickupResponse,
+    summary="Actualizar estado de la solicitud (soporte POST/PATCH)",
+)
 async def update_pickup_status_endpoint(
     pickup_id: UUID,
     payload: PickupStatusUpdate,
