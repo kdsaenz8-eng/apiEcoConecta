@@ -21,10 +21,41 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "..", "ecoconecta.db")
 WEB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "web"))
+STATIC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "static"))
+UPLOADS_DIR = os.path.join(STATIC_DIR, "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 SECRET_SALT = b"ecoconecta_ecoconecta_secure_salt_2026"
 JWT_SECRET_KEY = "ecoconecta_super_secret_jwt_key_2026_municipio"
 JWT_EXPIRATION_HOURS = 24
+
+def save_base64_image(raw_photo: str) -> str:
+    """Decodifica y guarda una imagen en Base64 en el almacenamiento del servidor."""
+    if not raw_photo or not raw_photo.strip():
+        return None
+    clean = raw_photo.strip()
+    if not (clean.startswith("data:image/") or ";base64," in clean):
+        return clean
+    try:
+        if ";base64," in clean:
+            header, encoded = clean.split(";base64,", 1)
+        else:
+            header = "image/jpeg"
+            encoded = clean
+        ext = "jpg"
+        if "png" in header.lower():
+            ext = "png"
+        elif "webp" in header.lower():
+            ext = "webp"
+        data = base64.b64decode(encoded)
+        filename = f"evidence_{uuid.uuid4().hex[:12]}.{ext}"
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        with open(os.path.join(UPLOADS_DIR, filename), "wb") as f:
+            f.write(data)
+        return f"/api/v1/uploads/{filename}"
+    except Exception as exc:
+        print(f"[STORAGE ERROR] Error guardando foto Base64: {exc}")
+        return None
 
 def hash_pw(password: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), SECRET_SALT, 100000).hex()
@@ -251,7 +282,26 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
             }).encode("utf-8"))
             return
 
-        # 2. TODAS las demás rutas de API (/api/v1/...) DEBEN tener autenticación JWT
+        # 2. Servir imágenes de evidencia fotográfica públicamente a tags <img>
+        if path.startswith("/api/v1/uploads/") or path.startswith("/static/uploads/"):
+            filename = os.path.basename(path)
+            file_path = os.path.join(UPLOADS_DIR, filename)
+            if os.path.exists(file_path):
+                mimetype = "image/png" if filename.endswith(".png") else "image/jpeg"
+                self.send_response(200)
+                self.send_header("Content-Type", mimetype)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                with open(file_path, "rb") as f:
+                    self.wfile.write(f.read())
+                return
+            else:
+                self._set_json_headers(404)
+                self.wfile.write(json.dumps({"detail": "Imagen no encontrada."}).encode("utf-8"))
+                return
+
+        # 3. TODAS las demás rutas de API (/api/v1/...) DEBEN tener autenticación JWT
         if path.startswith("/api/v1/"):
             user = self._authenticate_request()
             if not user:
@@ -276,14 +326,39 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                 conn = sqlite3.connect(DB_FILE)
                 conn.row_factory = sqlite3.Row
                 c = conn.cursor()
-                c.execute("""
+
+                user_role = user.get("role")
+                user_id = user.get("sub")
+
+                # REGLA ESTRICTA DE VISIBILIDAD POR ROL:
+                # - GENERADOR: Solo visualiza sus propias solicitudes
+                # - RECICLADOR (/pickups): Solo las que le han sido asignadas
+                # - RECICLADOR (/pending): Solicitudes disponibles o asignadas
+                # - ADMINISTRADOR: Visualiza todas las solicitudes sin excepción
+                query = """
                 SELECT p.*, g.full_name as generator_name, g.phone as generator_phone, g.neighborhood,
                        r.full_name as recycler_name
                 FROM pickup_requests p
                 JOIN users g ON p.generator_id = g.id
                 LEFT JOIN users r ON p.recycler_id = r.id
-                ORDER BY p.created_at DESC
-                """)
+                """
+                params = ()
+
+                if user_role == "GENERADOR" or path == "/api/v1/pickups/my-requests":
+                    query += " WHERE p.generator_id = ? ORDER BY p.created_at DESC"
+                    params = (user_id,)
+                elif user_role == "RECICLADOR":
+                    if path == "/api/v1/pickups/pending":
+                        query += " WHERE (p.status = 'Pendiente' OR p.recycler_id = ?) ORDER BY p.created_at DESC"
+                        params = (user_id,)
+                    else:
+                        query += " WHERE p.recycler_id = ? ORDER BY p.created_at DESC"
+                        params = (user_id,)
+                else:
+                    # ADMINISTRADOR
+                    query += " ORDER BY p.created_at DESC"
+
+                c.execute(query, params)
                 rows = c.fetchall()
                 results = []
                 for r in rows:
@@ -496,6 +571,17 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
             if not user:
                 return
 
+            if path == "/api/v1/uploads":
+                image_data = body.get("image_base64") or body.get("photo_url")
+                saved = save_base64_image(image_data)
+                if saved:
+                    self._set_json_headers(201)
+                    self.wfile.write(json.dumps({"photo_url": saved}).encode("utf-8"))
+                else:
+                    self._set_json_headers(400)
+                    self.wfile.write(json.dumps({"detail": "No se pudo procesar la imagen de evidencia."}).encode("utf-8"))
+                return
+
             if path == "/api/v1/pickups":
                 # Inserción real en base de datos con coordenadas exactas
                 conn = sqlite3.connect(DB_FILE)
@@ -509,6 +595,9 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                 lat_exacta = float(body.get("latitude", 7.666925))
                 lon_exacta = float(body.get("longitude", -76.681140))
 
+                photo_raw = body.get("photo_url")
+                photo_final = save_base64_image(photo_raw) or photo_raw or "https://images.unsplash.com/photo-1532996122724-e3c354a0b15b?auto=format&fit=crop&w=600&q=80"
+
                 c.execute("""
                 INSERT INTO pickup_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
@@ -521,7 +610,7 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                     lat_exacta,
                     lon_exacta,
                     body.get("address_text", "Calle 98 # 102-15, Barrio Kennedy"),
-                    body.get("photo_url", "https://images.unsplash.com/photo-1532996122724-e3c354a0b15b?auto=format&fit=crop&w=600&q=80"),
+                    photo_final,
                     body.get("notes", ""),
                     now,
                     None,
@@ -536,6 +625,7 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                     "status": "Pendiente",
                     "latitude": lat_exacta,
                     "longitude": lon_exacta,
+                    "photo_url": photo_final,
                     "created_at": now,
                     "message": "Solicitud almacenada con éxito en la base de datos real."
                 }).encode("utf-8"))
@@ -545,7 +635,8 @@ class RealBackendHTTPHandler(SimpleHTTPRequestHandler):
                 # Formato: /api/v1/pickups/<id>/assign o /api/v1/pickups/<id>/claim
                 parts = path.split("/")
                 p_id = parts[4] if len(parts) > 4 else None
-                rec_id = body.get("recycler_id") or user.get("sub")
+                query_params = urllib.parse.parse_qs(parsed.query)
+                rec_id = body.get("recycler_id") or (query_params.get("recycler_id", [None])[0]) or user.get("sub")
                 now = datetime.now(timezone.utc).isoformat()
 
                 conn = sqlite3.connect(DB_FILE)

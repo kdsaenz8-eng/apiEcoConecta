@@ -56,8 +56,8 @@ class PickupCreate(BaseModel):
     )
     photo_url: Optional[str] = Field(
         default=None,
-        max_length=500,
-        description="URL de la foto de evidencia subida al almacenamiento Cloud",
+        max_length=10_000_000,
+        description="URL remota o Data URI Base64 de la foto de evidencia tomada por el usuario",
     )
     notes: Optional[str] = Field(
         default=None,

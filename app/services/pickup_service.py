@@ -19,6 +19,7 @@ from app.schemas.pickup import (
     PickupRecyclerPublicView,
     PickupStatusUpdate,
 )
+from app.services.storage_service import StorageService
 
 
 def calculate_haversine_distance_km(
@@ -110,7 +111,7 @@ class PickupService:
             latitude=payload.latitude,
             longitude=payload.longitude,
             address_text=payload.address_text,
-            photo_url=payload.photo_url,
+            photo_url=StorageService.save_base64_image(payload.photo_url),
             notes=payload.notes,
         )
         db.add(new_pickup)

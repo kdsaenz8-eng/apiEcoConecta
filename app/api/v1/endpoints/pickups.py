@@ -31,14 +31,25 @@ router = APIRouter(prefix="/pickups", tags=["Solicitudes de Recolección"])
 @router.get(
     "",
     response_model=List[PickupResponse],
-    summary="Listar todas las solicitudes (Administrador y panel de control)",
+    summary="Listar solicitudes según rol y permisos (Generador: propias, Reciclador: asignadas, Admin: todas)",
 )
 async def list_all_pickups(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> List[PickupResponse]:
-    """Retorna todas las solicitudes registradas para el panel administrativo o dashboard unificado."""
+    """
+    Retorna solicitudes filtradas estrictamente según el rol del usuario autenticado:
+    - GENERADOR: Solo las solicitudes creadas por él (generator_id == current_user.id).
+    - RECICLADOR: Solo las solicitudes que se le han asignado (recycler_id == current_user.id).
+    - ADMINISTRADOR: Todas las solicitudes del sistema para supervisión general y asignación.
+    """
     stmt = select(PickupRequest).order_by(PickupRequest.created_at.desc())
+    if current_user.role == UserRole.GENERADOR:
+        stmt = stmt.where(PickupRequest.generator_id == current_user.id)
+    elif current_user.role == UserRole.RECICLADOR:
+        stmt = stmt.where(PickupRequest.recycler_id == current_user.id)
+    # Administrador ve todo el universo de solicitudes sin restricción
+
     result = await db.execute(stmt)
     pickups = result.scalars().all()
     return [PickupResponse.model_validate(p) for p in pickups]

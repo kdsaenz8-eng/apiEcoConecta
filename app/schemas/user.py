@@ -8,7 +8,13 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+try:
+    import email_validator
+    from pydantic import EmailStr
+except (ImportError, Exception):
+    EmailStr = str
 
 from app.models.user import UserRole, UserTypeDetail
 
